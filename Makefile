@@ -1,3 +1,6 @@
+# You need vulkan (brew) and sdl (brew) and be on a mac
+# Just do make run in the terminal and ba boom we got it
+
 CXX = clang++
 
 EXE = $(BIN_DIR)/metal
