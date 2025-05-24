@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h> 
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
@@ -46,14 +47,20 @@ constexpr int SCREEN_HEIGHT = downscaled ? 216 * 2: 720;
 constexpr int WINDOW_WIDTH = 1280;
 constexpr int WINDOW_HEIGHT = 720;
 
+static struct {
+    int offsetX = downscaled ? ((SCREEN_WIDTH / 2) - 100) * 2 : (SCREEN_WIDTH / 2) + 300;
+    int offsetY = downscaled ? ((SCREEN_HEIGHT / 2) + 10) * 2 : (SCREEN_HEIGHT / 2) + 360;
+} top_down_view;
+
 constexpr f32 EYE_Z = 1.65f;
-constexpr f32 HFOV = deg_to_rad(90.0f);
-constexpr f32 VFOV = 0.5f;
+constexpr f32 HFOV = deg_to_rad(120.0f);
+constexpr f32 VFOV = 0.25f;
 
 constexpr f32 ZNEAR = 0.0001f;
 constexpr f32 ZFAR = 128.0f;
 
 const char *LEVEL_FILE = "level.txt";
+const char *GUN_TEXTURE_FILE = "doom_gun.png";
 
 struct v2 {
     f32 x, y;
@@ -125,6 +132,8 @@ struct Sector {
 static struct Developer_Config{
     bool show_ui;
     bool show_level_in_top_view;
+    bool toggle_window_size;
+    bool mouse_captured;
 
     struct Camera_Config {
         bool show_ui_of_camera;
@@ -133,6 +142,9 @@ static struct Developer_Config{
         f32 VFOV_runtime;
         f32 ZNEAR_runtime;
         f32 ZFAR_runtime;
+        f32 mouse_sensitivity;
+        f32 mouse_sensitivity_vertical;
+        f32 vertical_angle;
     } camera;
 
     struct Rendering_Config { bool show_ui_of_rendering; } renderer;
@@ -141,7 +153,15 @@ static struct Developer_Config{
         bool show_ui_of_level;
         struct Level_Data_Config { bool show_ui_of_data; char file_buf[256]; } data;
         struct Level_Sector_Config { bool show_ui_of_sector; int idx = -1; } sector;
-        struct Level_Wall_Config { bool show_ui_of_wall; bool clip_to_neighboring_wall; int idx = -1; } wall;
+        struct Level_Wall_Config { 
+            bool show_ui_of_wall; 
+            bool clip_to_neighboring_wall; 
+            int idx = -1;
+            bool is_creating_wall = false;
+            v2 wall_start_point;
+            int hovered_wall_idx = -1;
+            char hovered_point = 0; // 'A' or 'B' for which point is hovered
+        } wall;
     } level;
 } dev;
 
@@ -159,6 +179,11 @@ static struct {
     id<CAMetalDrawable> drawable;
     id<MTLCommandBuffer> commandBuffer;
 
+    // Add gun texture
+    id<MTLTexture> gunTexture;
+    int gunWidth;
+    int gunHeight;
+
     u32 *pixels;
     bool quit;
 
@@ -171,8 +196,17 @@ static struct {
         v2 pos;
         f32 angle, anglecos, anglesin;
         int sector;
+        f32 current_height;  // Current camera height
+        f32 target_height;   // Target height based on floor
+        f32 bob_time;        // Time counter for view bobbing
+        f32 bob_offset;      // Current bobbing offset
     } camera;
+
 } state;
+
+// Forward declarations
+static int load_sectors(const char *path);
+static int save_sectors(const char *path);
 
 static int load_sectors(const char *path) {
     state.sectors.n = 1;
@@ -217,6 +251,37 @@ static int load_sectors(const char *path) {
     done:
     fclose(f);
     return retval;
+}
+
+static int save_sectors(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+
+    fprintf(f, "[SECTOR]\n");
+    for (usize i = 1; i < state.sectors.n; ++i) {
+        if (state.sectors.arr[i].id == 0) continue;
+        const Sector *sector = &state.sectors.arr[i];
+        fprintf(f, "%d %zu %zu %.3f %.3f\n", 
+            sector->id, 
+            sector->firstwall, 
+            sector->nwalls, 
+            sector->zfloor, 
+            sector->zceil);
+    }
+
+    fprintf(f, "\n[WALL]\n");
+    for (usize i = 0; i < state.walls.n; ++i) {
+        const Wall *wall = &state.walls.arr[i];
+        fprintf(f, "%d %d %d %d %d\n", 
+            static_cast<int>(std::round(wall->a.x)), 
+            static_cast<int>(std::round(wall->a.y)), 
+            static_cast<int>(std::round(wall->b.x)), 
+            static_cast<int>(std::round(wall->b.y)), 
+            wall->portal);
+    }
+
+    fclose(f);
+    return 0;
 }
 
 static int screen_angle_to_x(const f32 angle) {
@@ -271,7 +336,13 @@ static void update_player_sector() {
             }
         }
     }
-    if (found_sector != SECTOR_NONE) state.camera.sector = found_sector;
+    if (found_sector != SECTOR_NONE) {
+        state.camera.sector = found_sector;
+        // Update target height when changing sectors
+        if (state.camera.sector > 0 && state.camera.sector < static_cast<int>(state.sectors.n)) {
+            state.camera.target_height = state.sectors.arr[state.camera.sector].zfloor + EYE_Z;
+        }
+    }
     else {
         bool truly_lost = true;
         for (usize k = 1; k < state.sectors.n; ++k) {
@@ -279,6 +350,132 @@ static void update_player_sector() {
         }
         if (truly_lost) state.camera.sector = (current_cam_sector_id > 0 && current_cam_sector_id < static_cast<int>(state.sectors.n) && state.sectors.arr[current_cam_sector_id].id != 0 ? current_cam_sector_id : 1);
         if (state.camera.sector <= 0 || state.camera.sector >= static_cast<int>(state.sectors.n) || state.sectors.arr[state.camera.sector].id == 0) state.camera.sector = 1;
+    }
+}
+
+static void update_camera_height() {
+    const f32 height_lerp_speed_up = 0.1f;
+    const f32 height_lerp_speed_down = 0.3f;
+    const f32 height_diff = state.camera.target_height - state.camera.current_height;
+    const f32 height_lerp_speed = height_diff > 0 ? height_lerp_speed_up : height_lerp_speed_down;
+    
+    const f32 random_factor = 0.02f * (static_cast<f32>(rand()) / RAND_MAX - 0.5f);
+    state.camera.current_height = std::lerp(state.camera.current_height, state.camera.target_height + random_factor, height_lerp_speed);
+}
+
+static void apply_view_bobbing(const v2& move_input) {
+    const f32 bob_speed = 10.0f;
+    const f32 bob_amount = 0.17f;
+    
+    if (length(move_input) > 0.001f) {
+        state.camera.bob_time += 0.016f * bob_speed;
+        state.camera.bob_offset = std::sin(state.camera.bob_time) * bob_amount;
+    } else {
+        state.camera.bob_time = 0.0f;
+        state.camera.bob_offset = std::lerp(state.camera.bob_offset, 0.0f, 0.2f);
+    }
+}
+
+static v2 handle_movement_input(const u8* keystate) {
+    v2 move_input = {0.0f, 0.0f};
+    const f32 move_speed = 3.0f * 0.016f;
+
+    if (dev.show_level_in_top_view) {
+        const int arrow_key_speed = 10;
+        if (keystate[SDL_SCANCODE_LEFT]) top_down_view.offsetX -= arrow_key_speed;
+        if (keystate[SDL_SCANCODE_RIGHT]) top_down_view.offsetX += arrow_key_speed;
+        if (keystate[SDL_SCANCODE_UP]) top_down_view.offsetY -= arrow_key_speed;
+        if (keystate[SDL_SCANCODE_DOWN]) top_down_view.offsetY += arrow_key_speed;
+    }
+    else if (!dev.show_level_in_top_view) {
+        if (keystate[SDL_SCANCODE_W]) {
+            move_input.x += state.camera.anglecos;
+            move_input.y += state.camera.anglesin;
+        }
+        if (keystate[SDL_SCANCODE_S]) {
+            move_input.x -= state.camera.anglecos;
+            move_input.y -= state.camera.anglesin;
+        }
+        if (keystate[SDL_SCANCODE_A]) {
+            move_input.x += state.camera.anglesin;
+            move_input.y -= state.camera.anglecos;
+        }
+        if (keystate[SDL_SCANCODE_D]) {
+            move_input.x -= state.camera.anglesin;
+            move_input.y += state.camera.anglecos;
+        }
+
+        if (length(move_input) > 0.001f) {
+            v2 move_dir = normalize(move_input);
+            state.camera.pos.x += move_dir.x * move_speed;
+            state.camera.pos.y += move_dir.y * move_speed;
+        }
+    }
+
+    return move_input;
+}
+
+static void handle_sdl_events() {
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        ImGui_ImplSDL2_ProcessEvent(&ev);
+        if (ev.type == SDL_QUIT) state.quit = true;
+        if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_CLOSE && ev.window.windowID == SDL_GetWindowID(state.window)) state.quit = true;
+        
+        if (ev.type == SDL_KEYDOWN) {
+            if (ev.key.keysym.sym == SDLK_F2) { 
+                dev.show_ui = !dev.show_ui;
+                dev.mouse_captured = !dev.show_level_in_top_view && !dev.show_ui;
+                SDL_SetRelativeMouseMode(dev.mouse_captured ? SDL_TRUE : SDL_FALSE);
+            }
+            if (ev.key.keysym.sym == SDLK_ESCAPE) {
+                dev.mouse_captured = false;
+                SDL_SetRelativeMouseMode(SDL_FALSE);
+            }
+        }
+        
+        if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
+            if (!dev.mouse_captured && !dev.show_level_in_top_view && !dev.show_ui) {
+                dev.mouse_captured = true;
+                SDL_SetRelativeMouseMode(SDL_TRUE);
+            }
+            else if ((dev.show_level_in_top_view || dev.show_ui) && (SDL_GetModState() & KMOD_SHIFT)) {
+                int mouseX, mouseY;
+                SDL_GetMouseState(&mouseX, &mouseY);
+                constexpr float scale = downscaled ? 30.0f * 2 : 100.0f;
+                const int offsetX = top_down_view.offsetX;
+                const int offsetY = top_down_view.offsetY;
+
+                v2 world_pos = {
+                    (mouseX - offsetX) / -scale,
+                    (mouseY - offsetY) / -scale
+                };
+
+                if (!dev.level.wall.is_creating_wall) {
+                    dev.level.wall.is_creating_wall = true;
+                    dev.level.wall.wall_start_point = world_pos;
+                } else {
+                    if (state.walls.n < sizeof(state.walls.arr) / sizeof(state.walls.arr[0])) {
+                        Wall* new_wall = &state.walls.arr[state.walls.n++];
+                        new_wall->a = dev.level.wall.wall_start_point;
+                        new_wall->b = world_pos;
+                        new_wall->portal = SECTOR_NONE;
+                    }
+                    dev.level.wall.is_creating_wall = false;
+                }
+            }
+        }
+        
+        if (ev.type == SDL_MOUSEMOTION) {
+            if (dev.mouse_captured && !dev.show_level_in_top_view && !dev.show_ui) {
+                state.camera.angle += ev.motion.xrel * dev.camera.mouse_sensitivity;
+                state.camera.anglecos = std::cos(state.camera.angle);
+                state.camera.anglesin = std::sin(state.camera.angle);
+                
+                dev.camera.vertical_angle += ev.motion.yrel * dev.camera.mouse_sensitivity_vertical;
+                dev.camera.vertical_angle = std::clamp(dev.camera.vertical_angle, -PI_2, PI_2);
+            }
+        }
     }
 }
 
@@ -389,17 +586,17 @@ static void render_game_with_sdl() {
 
             const f32 sy0 = ifnan((dev.camera.VFOV_runtime * SCREEN_HEIGHT) / cp0.y, 1e10f);
             const f32 sy1 = ifnan((dev.camera.VFOV_runtime * SCREEN_HEIGHT) / cp1.y, 1e10f);
-            const int yf0_curr  = SCREEN_HEIGHT / 2 + static_cast<int>((z_floor  - dev.camera.EYE_Z_runtime) * sy0);
-            const int yc0_curr  = SCREEN_HEIGHT / 2 + static_cast<int>((z_ceil   - dev.camera.EYE_Z_runtime) * sy0);
-            const int yf1_curr  = SCREEN_HEIGHT / 2 + static_cast<int>((z_floor  - dev.camera.EYE_Z_runtime) * sy1);
-            const int yc1_curr  = SCREEN_HEIGHT / 2 + static_cast<int>((z_ceil   - dev.camera.EYE_Z_runtime) * sy1);
+            const int yf0_curr  = SCREEN_HEIGHT / 2 + static_cast<int>((z_floor  - dev.camera.EYE_Z_runtime) * sy0) + static_cast<int>(dev.camera.vertical_angle * SCREEN_HEIGHT);
+            const int yc0_curr  = SCREEN_HEIGHT / 2 + static_cast<int>((z_ceil   - dev.camera.EYE_Z_runtime) * sy0) + static_cast<int>(dev.camera.vertical_angle * SCREEN_HEIGHT);
+            const int yf1_curr  = SCREEN_HEIGHT / 2 + static_cast<int>((z_floor  - dev.camera.EYE_Z_runtime) * sy1) + static_cast<int>(dev.camera.vertical_angle * SCREEN_HEIGHT);
+            const int yc1_curr  = SCREEN_HEIGHT / 2 + static_cast<int>((z_ceil   - dev.camera.EYE_Z_runtime) * sy1) + static_cast<int>(dev.camera.vertical_angle * SCREEN_HEIGHT);
             
             int yf0_neigh = 0, yc0_neigh = 0, yf1_neigh = 0, yc1_neigh = 0;
             if (is_portal) {
-                yf0_neigh = SCREEN_HEIGHT / 2 + static_cast<int>((nz_floor - dev.camera.EYE_Z_runtime) * sy0);
-                yc0_neigh = SCREEN_HEIGHT / 2 + static_cast<int>((nz_ceil  - dev.camera.EYE_Z_runtime) * sy0);
-                yf1_neigh = SCREEN_HEIGHT / 2 + static_cast<int>((nz_floor - dev.camera.EYE_Z_runtime) * sy1);
-                yc1_neigh = SCREEN_HEIGHT / 2 + static_cast<int>((nz_ceil  - dev.camera.EYE_Z_runtime) * sy1);
+                yf0_neigh = SCREEN_HEIGHT / 2 + static_cast<int>((nz_floor - dev.camera.EYE_Z_runtime) * sy0) + static_cast<int>(dev.camera.vertical_angle * SCREEN_HEIGHT);
+                yc0_neigh = SCREEN_HEIGHT / 2 + static_cast<int>((nz_ceil  - dev.camera.EYE_Z_runtime) * sy0) + static_cast<int>(dev.camera.vertical_angle * SCREEN_HEIGHT);
+                yf1_neigh = SCREEN_HEIGHT / 2 + static_cast<int>((nz_floor - dev.camera.EYE_Z_runtime) * sy1) + static_cast<int>(dev.camera.vertical_angle * SCREEN_HEIGHT);
+                yc1_neigh = SCREEN_HEIGHT / 2 + static_cast<int>((nz_ceil  - dev.camera.EYE_Z_runtime) * sy1) + static_cast<int>(dev.camera.vertical_angle * SCREEN_HEIGHT);
             }
 
             for (int x = render_x0; x < render_x1; x++) {
@@ -518,8 +715,47 @@ static void draw_circle(int x0, int y0, int radius, u32 color) {
 static void render_level_with_sdl() {
     memset(state.pixels, 0x1F1F1F, SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(u32));
     constexpr float scale = downscaled ? 30.0f * 2 : 100.0f;
-    constexpr int offsetX = downscaled ? ((SCREEN_WIDTH / 2) - 100) * 2 : (SCREEN_WIDTH / 2) + 300;
-    constexpr int offsetY = downscaled ? ((SCREEN_HEIGHT / 2) + 10) * 2 : (SCREEN_HEIGHT / 2) + 360;
+    const int offsetX = top_down_view.offsetX;
+    const int offsetY = top_down_view.offsetY;
+
+    // Get mouse position
+    int mouseX, mouseY;
+    SDL_GetMouseState(&mouseX, &mouseY);
+
+    // Reset hover state
+    dev.level.wall.hovered_wall_idx = -1;
+    dev.level.wall.hovered_point = 0;
+
+    // Check for wall point hover
+    constexpr int hover_radius = 5;
+    for (usize i = 0; i < state.walls.n; i++) {
+        const Wall *wall = &state.walls.arr[i];
+        int x0_map = offsetX - static_cast<int>(std::round(wall->a.x * scale));
+        int y0_map = offsetY - static_cast<int>(std::round(wall->a.y * scale));
+        int x1_map = offsetX - static_cast<int>(std::round(wall->b.x * scale));
+        int y1_map = offsetY - static_cast<int>(std::round(wall->b.y * scale));
+
+        // Check point A
+        if (std::abs(mouseX - x0_map) < hover_radius && std::abs(mouseY - y0_map) < hover_radius) {
+            dev.level.wall.hovered_wall_idx = i;
+            dev.level.wall.hovered_point = 'A';
+            draw_circle(x0_map, y0_map, hover_radius, 0xFFFFFF00);
+        }
+        // Check point B
+        else if (std::abs(mouseX - x1_map) < hover_radius && std::abs(mouseY - y1_map) < hover_radius) {
+            dev.level.wall.hovered_wall_idx = i;
+            dev.level.wall.hovered_point = 'B';
+            draw_circle(x1_map, y1_map, hover_radius, 0xFFFFFF00);
+        }
+    }
+
+    // Draw wall creation preview
+    if (dev.level.wall.is_creating_wall) {
+        int startX = offsetX - static_cast<int>(std::round(dev.level.wall.wall_start_point.x * scale));
+        int startY = offsetY - static_cast<int>(std::round(dev.level.wall.wall_start_point.y * scale));
+        draw_line_solid(startX, startY, mouseX, mouseY, 0xFFFFFF00);
+        draw_circle(startX, startY, hover_radius, 0xFFFFFF00);
+    }
 
     if (dev.level.sector.idx > 0 && dev.level.sector.idx < (int)state.sectors.n && state.sectors.arr[dev.level.sector.idx].id != 0) {
         const Sector *selected_sector_ptr = &state.sectors.arr[dev.level.sector.idx];
@@ -644,8 +880,59 @@ static void render_metal_frame_with_imgui() {
     }
     ImGui::End();
 
+    // Render gun if not in UI or level editor mode
+    if (!dev.show_ui && !dev.show_level_in_top_view && state.gunTexture) {
+        static bool first_render = true;
+        if (first_render) {
+            printf("Rendering gun texture: %dx%d\n", state.gunWidth, state.gunHeight);
+            first_render = false;
+        }
+        
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+        ImGui::Begin("GunOverlay", nullptr, 
+            ImGuiWindowFlags_NoTitleBar | 
+            ImGuiWindowFlags_NoResize | 
+            ImGuiWindowFlags_NoMove | 
+            ImGuiWindowFlags_NoScrollbar | 
+            ImGuiWindowFlags_NoScrollWithMouse | 
+            ImGuiWindowFlags_NoCollapse | 
+            ImGuiWindowFlags_NoBackground | 
+            ImGuiWindowFlags_NoSavedSettings | 
+            ImGuiWindowFlags_NoInputs);
+
+        // Calculate position to center the gun at the bottom of the screen
+        float gunScale = 0.5f;
+        float scaledWidth = state.gunWidth * gunScale;
+        float scaledHeight = state.gunHeight * gunScale;
+        
+        float baseXPos = (ImGui::GetIO().DisplaySize.x - scaledWidth) * 0.5f;
+        float baseYPos = ImGui::GetIO().DisplaySize.y - scaledHeight;
+        
+        float verticalBob = std::sin(state.camera.bob_time) * 10.0f;
+        float horizontalBob = std::cos(state.camera.bob_time) * 5.0f;
+        
+        float xPos = baseXPos + horizontalBob;
+        float yPos = baseYPos + verticalBob;
+
+        ImGui::SetCursorPos(ImVec2(xPos, yPos));
+        ImGui::Image((ImTextureID)state.gunTexture, ImVec2(scaledWidth, scaledHeight));
+
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+    } else if (state.gunTexture) {
+        static bool first_skip = true;
+        if (first_skip) first_skip = false;
+    }
+
     if (dev.show_ui) {
+        // Engine
         ImGui::Begin("Engine Config", &dev.show_ui);
+        if (ImGui::Button("Toggle Window Size")) dev.toggle_window_size = !dev.toggle_window_size;
+        ImGui::Separator();
+        // Engine -> Camera Config
         if (ImGui::Button("Camera Config")) dev.camera.show_ui_of_camera = !dev.camera.show_ui_of_camera;
         if (dev.camera.show_ui_of_camera) {
             ImGui::Begin("Camera Config", &dev.camera.show_ui_of_camera);
@@ -656,15 +943,20 @@ static void render_metal_frame_with_imgui() {
             }
             ImGui::Text("Calculated Sin: %.2f, Cos: %.2f", state.camera.anglesin, state.camera.anglecos);
             ImGui::Text("Current Sector ID: %d", state.camera.sector);
-            ImGui::End();
+            ImGui::SliderFloat("Mouse Sensitivity (Horizontal)", &dev.camera.mouse_sensitivity, 0.0001f, 0.01f, "%.4f");
+            ImGui::SliderFloat("Mouse Sensitivity (Vertical)", &dev.camera.mouse_sensitivity_vertical, 0.0001f, 0.01f, "%.4f");
+            ImGui::Text("Mouse Captured: %s", dev.mouse_captured ? "Yes" : "No");
+            ImGui::Text("Controls: WASD to move, Mouse to look, ESC to toggle mouse capture");
+            ImGui::End(); // End Camera Config
         }
+        // Engine -> Renderer Config
         ImGui::SameLine();
         if (ImGui::Button("Rendering Config")) dev.renderer.show_ui_of_rendering = ! dev.renderer.show_ui_of_rendering;
         if (dev.renderer.show_ui_of_rendering) {
             ImGui::Begin("Rendering Config", &dev.renderer.show_ui_of_rendering);
-            ImGui::SliderFloat("VFOV Factor", &dev.camera.VFOV_runtime, 0.1f, 2.0f);
-            ImGui::End();
+            ImGui::End(); // End Renderer Config
         }
+        // Engine -> Level Config
         ImGui::SameLine();
         if (ImGui::Button("Level Config")) dev.level.show_ui_of_level = ! dev.level.show_ui_of_level;
         if (dev.level.show_ui_of_level) {
@@ -682,9 +974,18 @@ static void render_metal_frame_with_imgui() {
                     state.camera.angle = 0.0f;
                     state.camera.sector = 1;
                 }
-                ImGui::Text("Loaded Sectors: %zu (max_id %zu)", std::count_if(state.sectors.arr + 1, state.sectors.arr + state.sectors.n, [](const Sector &s){ return s.id != 0; }), state.sectors.n > 0 ? state.sectors.n - 1 : 0);
-                ImGui::Text("Loaded Walls: %zu", state.walls.n);
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Save Level")) {
+                int save_ret = save_sectors(dev.level.data.file_buf);
+                if (save_ret != 0) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error",("Failed to save level: " + std::to_string(save_ret)).c_str(), state.window);
+                else {
+                    printf("Saved %s: %zu sectors, %zu walls\n", dev.level.data.file_buf, state.sectors.n, state.walls.n);
+                }
+            }
+            ImGui::Text("Loaded Sectors: %zu (max_id %zu)", std::count_if(state.sectors.arr + 1, state.sectors.arr + state.sectors.n, [](const Sector &s){ return s.id != 0; }), state.sectors.n > 0 ? state.sectors.n - 1 : 0);
+            ImGui::Text("Loaded Walls: %zu", state.walls.n);
+            // Engine -> Level Config -> Sector Config
             if (ImGui::Button("Sector Config")) dev.level.sector.show_ui_of_sector = ! dev.level.sector.show_ui_of_sector;
             if (dev.level.sector.show_ui_of_sector) {
                 ImGui::Begin("Sector Config", &dev.level.sector.show_ui_of_sector);
@@ -709,9 +1010,10 @@ static void render_metal_frame_with_imgui() {
                     ImGui::DragFloat("Ceil Z", &selected_s.zceil, 0.05f);
                     ImGui::Text("First Wall Index: %zu, Num Walls: %zu", selected_s.firstwall, selected_s.nwalls);
                     ImGui::PopID();
-                }
+                } // End Sector Config
                 ImGui::End();
             }
+            // Engine -> Level Config -> Wall Config
             ImGui::SameLine();
             if (ImGui::Button("Wall Config")) dev.level.wall.show_ui_of_wall = !dev.level.wall.show_ui_of_wall;
             if (dev.level.wall.show_ui_of_wall) {
@@ -804,7 +1106,7 @@ static void render_metal_frame_with_imgui() {
                     if (ImGui::DragFloat2("##CoordsB", &selected_w.b.x, drag_speed)) {
                          if (s_active_drag_wall_idx == dev.level.wall.idx && s_active_drag_point_char == 'B') {
                             if (dev.level.wall.clip_to_neighboring_wall) {
-                                for (const auto& linked_info : s_linked_points_for_this_drag) {
+                                for (const auto &linked_info : s_linked_points_for_this_drag) {
                                     Wall& linked_wall = state.walls.arr[linked_info.first];
                                     if (linked_info.second == 'A') linked_wall.a = selected_w.b;
                                     else linked_wall.b = selected_w.b;
@@ -833,7 +1135,7 @@ static void render_metal_frame_with_imgui() {
                             }
                         }
                         if (dev.level.wall.clip_to_neighboring_wall) {
-                            for (const auto& linked_info : s_linked_points_for_this_drag) {
+                            for (const auto &linked_info : s_linked_points_for_this_drag) {
                                 Wall& linked_wall = state.walls.arr[linked_info.first];
                                 if (linked_info.second == 'A') linked_wall.a = selected_w.b;
                                 else linked_wall.b = selected_w.b;
@@ -854,14 +1156,14 @@ static void render_metal_frame_with_imgui() {
                     ImGui::InputInt("Portal To Sector ID", &selected_w.portal);
                     if (selected_w.portal < SECTOR_NONE || selected_w.portal >= SECTOR_MAX) selected_w.portal = SECTOR_NONE;
                     ImGui::PopID();
-                }
+                } // Eng Wall Config
                 ImGui::End();
-            }
+            } // End Level Config
             ImGui::End();
         }
         ImGui::Separator();
         ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
-        ImGui::End();
+        ImGui::End(); // End Engine
     }
 
     ImGui::Render();
@@ -876,33 +1178,56 @@ static void render_metal_frame_with_imgui() {
 
 static void init_sdl_and_state() {
     ASSERT(!SDL_Init(SDL_INIT_VIDEO), "SDL failed to initialize: %s", SDL_GetError());
+    int imgFlags = IMG_INIT_PNG;
+    ASSERT((IMG_Init(imgFlags) & imgFlags) == imgFlags, "SDL_image failed to initialize: %s", IMG_GetError());
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
     SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
-    state.window = SDL_CreateWindow("DEMO", SDL_WINDOWPOS_CENTERED_DISPLAY(0), SDL_WINDOWPOS_CENTERED_DISPLAY(0), WINDOW_WIDTH, WINDOW_HEIGHT, SDL_WINDOW_ALLOW_HIGHDPI);
+
+    state.window = SDL_CreateWindow("DEMO", SDL_WINDOWPOS_CENTERED_DISPLAY(0), SDL_WINDOWPOS_CENTERED_DISPLAY(0), WINDOW_WIDTH, WINDOW_HEIGHT, SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
     ASSERT(state.window, "failed to create SDL window: %s\n", SDL_GetError());
+
     state.renderer = SDL_CreateRenderer(state.window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     ASSERT(state.renderer, "failed to create SDL renderer: %s\n", SDL_GetError());
+
     state.pixels = new u32[SCREEN_WIDTH * SCREEN_HEIGHT];
     ASSERT(state.pixels, "failed to allocate pixel buffer\n");
+
     state.camera.pos = {3.0f, 3.0f};
     state.camera.angle = 0.0f;
     state.camera.sector = 1;
+    state.camera.current_height = EYE_Z;
+    state.camera.target_height = EYE_Z;
+    state.camera.bob_time = 0.0f;
+    state.camera.bob_offset = 0.0f;
+
     dev.camera.EYE_Z_runtime = EYE_Z;
     dev.camera.HFOV_runtime = HFOV;
     dev.camera.VFOV_runtime = VFOV;
     dev.camera.ZFAR_runtime = ZFAR;
     dev.camera.ZNEAR_runtime = ZNEAR;
-    dev.show_ui = true;
+    dev.camera.mouse_sensitivity = 0.0025f;
+    dev.camera.mouse_sensitivity_vertical = 0.0025f;
+    dev.camera.vertical_angle = 0.0f;
+
+    dev.show_ui = false;
     dev.show_level_in_top_view = false;
-    dev.camera.show_ui_of_camera = dev.show_ui;
-    dev.renderer.show_ui_of_rendering = dev.show_ui;
-    dev.level.show_ui_of_level = dev.show_ui;
-    dev.level.data.show_ui_of_data = dev.show_ui;
-    dev.level.sector.show_ui_of_sector = dev.show_ui;
+    dev.toggle_window_size = false;
+    dev.mouse_captured = true;
+
+    dev.camera.show_ui_of_camera = true;
+
+    dev.renderer.show_ui_of_rendering = true;
+
+    dev.level.show_ui_of_level = true;
+    dev.level.data.show_ui_of_data = true;
+
+    dev.level.sector.show_ui_of_sector = true;
     dev.level.sector.idx = -1;
-    dev.level.wall.show_ui_of_wall = dev.show_ui;
+
+    dev.level.wall.show_ui_of_wall = true;
     dev.level.wall.idx = -1;
     dev.level.wall.clip_to_neighboring_wall = true;
+
     state.quit = false;
 }
 
@@ -911,98 +1236,120 @@ static void init_metal_pipeline() {
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
+
     ASSERT(state.renderer, "SDL Renderer not initialized before Metal setup\n");
+
     state.layer = (__bridge CAMetalLayer *)SDL_RenderGetMetalLayer(state.renderer);
     ASSERT(state.layer, "Failed to get Metal layer from SDL renderer.\n");
+
     state.layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     state.device = state.layer.device;
     ASSERT(state.device, "CAMetalLayer has no MTLDevice.\n");
+
     state.commandQueue = [state.device newCommandQueue];
     ASSERT(state.commandQueue, "Failed to create MTLCommandQueue.\n");
+
     state.renderPassDescriptor = [MTLRenderPassDescriptor new];
     ASSERT(state.renderPassDescriptor, "Failed to create MTLRenderPassDescriptor.\n");
+
     state.renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
     state.renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
     state.renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
-    MTLTextureDescriptor *textureDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:SCREEN_WIDTH height:SCREEN_HEIGHT mipmapped:NO];
+
+    // Load gun texture
+    SDL_Surface* gunSurface = IMG_Load(GUN_TEXTURE_FILE);
+    if (!gunSurface) printf("Failed to load doom_gun.png: %s\n", SDL_GetError());
+    else {
+        state.gunWidth = gunSurface->w;
+        state.gunHeight = gunSurface->h;
+        
+        // Convert RGBA to BGRA
+        u32* pixels = (u32*)gunSurface->pixels;
+        for (int i = 0; i < gunSurface->w * gunSurface->h; i++) {
+            u32 pixel = pixels[i];
+            u8 r = (pixel >> 0) & 0xFF;
+            u8 g = (pixel >> 8) & 0xFF;
+            u8 b = (pixel >> 16) & 0xFF;
+            u8 a = (pixel >> 24) & 0xFF;
+            pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+        
+        MTLTextureDescriptor* gunTextureDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:gunSurface->w height:gunSurface->h mipmapped:NO];
+        gunTextureDesc.usage = MTLTextureUsageShaderRead;
+        gunTextureDesc.storageMode = MTLStorageModeManaged;
+        
+        state.gunTexture = [state.device newTextureWithDescriptor:gunTextureDesc];
+        if (!state.gunTexture) printf("Failed to create gun texture\n");
+        else [state.gunTexture replaceRegion:MTLRegionMake2D(0, 0, gunSurface->w, gunSurface->h) mipmapLevel:0 withBytes:gunSurface->pixels bytesPerRow:gunSurface->pitch];
+        
+        SDL_FreeSurface(gunSurface);
+    }
+
+    MTLTextureDescriptor* textureDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm  width:SCREEN_WIDTH  height:SCREEN_HEIGHT  mipmapped:NO];
     textureDescriptor.usage = MTLTextureUsageShaderRead;
     textureDescriptor.storageMode = MTLStorageModeManaged;
     state.gameViewMetalTexture = [state.device newTextureWithDescriptor:textureDescriptor];
     ASSERT(state.gameViewMetalTexture, "Failed to create gameViewMetalTexture.\n");
+
     state.gameViewMetalTexture.label = @"GameViewSoftwareRenderTexture";
     bool imgui_sdl_init_success = ImGui_ImplSDL2_InitForMetal(state.window);
     ASSERT(imgui_sdl_init_success, "ImGui_ImplSDL2_InitForMetal failed.\n");
+
     bool imgui_metal_init_success = ImGui_ImplMetal_Init(state.device);
     ASSERT(imgui_metal_init_success, "ImGui_ImplMetal_Init failed.\n");
 }
 
 int main(int argc, char *argv[]) {
     int retval = 0;
+
     strncpy(dev.level.data.file_buf, LEVEL_FILE, sizeof(dev.level.data.file_buf) - 1);
     dev.level.data.file_buf[sizeof(dev.level.data.file_buf) - 1] = '\0';
+
     init_sdl_and_state();
     init_metal_pipeline();
     retval = load_sectors(LEVEL_FILE);
+
     ASSERT(retval == 0, "error while loading sectors: %d\n", retval);
     printf("loaded %zu sectors (max_id %zu) with %zu walls\n", std::count_if(state.sectors.arr + 1, state.sectors.arr + state.sectors.n, [](const Sector &s) { return s.id != 0; }), state.sectors.n > 0 ? state.sectors.n - 1 : 0, state.walls.n);
 
     while (!state.quit) {
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            ImGui_ImplSDL2_ProcessEvent(&ev);
-            if (ev.type == SDL_QUIT) state.quit = true;
-            if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_CLOSE && ev.window.windowID == SDL_GetWindowID(state.window)) state.quit = true;
-            if (ev.type == SDL_KEYDOWN) if (ev.key.keysym.sym == SDLK_F2) { dev.show_ui = !dev.show_ui; }
-        }
+        handle_sdl_events();
         if (state.quit) break;
 
-        const f32 rot_speed = 3.0f * 0.016f, move_speed = 3.0f * 0.016f;
         const u8 *keystate = SDL_GetKeyboardState(nullptr);
-        if (keystate[SDL_SCANCODE_RIGHT]) state.camera.angle += rot_speed;
-        if (keystate[SDL_SCANCODE_LEFT]) state.camera.angle -= rot_speed;
-        state.camera.anglecos = std::cos(state.camera.angle);
-        state.camera.anglesin = std::sin(state.camera.angle);
-        v2 move_input = {0.0f, 0.0f};
-        if (keystate[SDL_SCANCODE_UP] || keystate[SDL_SCANCODE_W]) {
-            move_input.x += state.camera.anglecos;
-            move_input.y += state.camera.anglesin;
-        }
-        if (keystate[SDL_SCANCODE_DOWN] || keystate[SDL_SCANCODE_S]) {
-            move_input.x -= state.camera.anglecos;
-            move_input.y -= state.camera.anglesin;
-        }
-        if (keystate[SDL_SCANCODE_A]) {
-            move_input.x += state.camera.anglesin;
-            move_input.y -= state.camera.anglecos;
-        }
-        if (keystate[SDL_SCANCODE_D]) {
-            move_input.x -= state.camera.anglesin;
-            move_input.y += state.camera.anglecos;
-        }
-        if (length(move_input) > 0.001f) {
-            v2 move_dir = normalize(move_input);
-            state.camera.pos.x += move_dir.x * move_speed;
-            state.camera.pos.y += move_dir.y * move_speed;
-        }
+        v2 move_input = handle_movement_input(keystate);
+
+        if (dev.toggle_window_size) SDL_MaximizeWindow(state.window);
+        else SDL_RestoreWindow(state.window);
+
         update_player_sector();
         memset(state.pixels, 0x1F1F1F, SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(u32));
-        if (dev.show_level_in_top_view) {
-             render_level_with_sdl(); 
-        } else {
-             render_game_with_sdl();
-        }
+
+        if (dev.show_level_in_top_view) render_level_with_sdl(); 
+        else render_game_with_sdl();
+
+        update_camera_height();
+        apply_view_bobbing(move_input);
+        dev.camera.EYE_Z_runtime = state.camera.current_height + state.camera.bob_offset;
+
         render_metal_frame_with_imgui();
     }
 
     delete[] state.pixels;
+
     ImGui_ImplMetal_Shutdown();
     ImGui_ImplSDL2_Shutdown();
+
     ImGui::DestroyContext();
+
     state.gameViewMetalTexture = nil;
     state.renderPassDescriptor = nil;
     state.commandQueue = nil;
+    state.gunTexture = nil;
+
     if (state.renderer) SDL_DestroyRenderer(state.renderer);
     if (state.window) SDL_DestroyWindow(state.window);
+
     SDL_Quit();
     return 0;
 }

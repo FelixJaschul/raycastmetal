@@ -1,52 +1,48 @@
-# You need vulkan (brew) and sdl (brew) and be on a mac
-# Just do make run in the terminal and ba boom we got it
+# Simple Makefile for Metal project
 
 CXX = clang++
+CXXFLAGS = -std=c++20 -Ilib -I/usr/local/include -I. `sdl2-config --cflags` -Wall -Wformat
+OBJCXXFLAGS = $(CXXFLAGS) -ObjC++ -fobjc-weak -fobjc-arc
 
-EXE = $(BIN_DIR)/metal
-IMGUI_DIR = /Library/Developer/CommandLineTools/usr/include/IMGUI
-BIN_DIR = bin
-SOURCES = main.mm
-SOURCES += $(IMGUI_DIR)/imgui.cpp $(IMGUI_DIR)/imgui_demo.cpp $(IMGUI_DIR)/imgui_draw.cpp $(IMGUI_DIR)/imgui_tables.cpp $(IMGUI_DIR)/imgui_widgets.cpp
-SOURCES += $(IMGUI_DIR)/backends/imgui_impl_sdl2.cpp $(IMGUI_DIR)/backends/imgui_impl_metal.mm
-OBJS = $(addprefix $(BIN_DIR)/, $(addsuffix .o, $(basename $(notdir $(SOURCES)))))
+SRCS = main.mm \
+       lib/imgui.cpp lib/imgui_demo.cpp lib/imgui_draw.cpp lib/imgui_tables.cpp lib/imgui_widgets.cpp \
+       lib/imgui_impl_sdl2.cpp lib/imgui_impl_metal.mm
 
-LIBS = -framework Metal -framework MetalKit -framework Cocoa -framework IOKit -framework CoreVideo -framework QuartzCore
-LIBS += `sdl2-config --libs`
-LIBS += -L/usr/local/lib
+OBJS = $(SRCS:.cpp=.o)
+OBJS := $(OBJS:.mm=.o)
+OBJS := $(addprefix obj/,$(notdir $(OBJS)))
 
-CXXFLAGS = -std=c++20 -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends -I/usr/local/include
-CXXFLAGS += `sdl2-config --cflags`
-CXXFLAGS += -Wall -Wformat
-CFLAGS = $(CXXFLAGS)
+LIBS = -framework Metal -framework MetalKit -framework Cocoa -framework IOKit -framework CoreVideo -framework QuartzCore `sdl2-config --libs` -L/usr/local/lib -lSDL2_image
 
-$(BIN_DIR)/%.o:%.cpp | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+TARGET = bin/metal
 
-$(BIN_DIR)/%.o:$(IMGUI_DIR)/%.cpp | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+.PHONY: all clean run
 
-$(BIN_DIR)/%.o:$(IMGUI_DIR)/backends/%.cpp | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+all: $(TARGET)
 
-$(BIN_DIR)/%.o:%.mm | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -ObjC++ -fobjc-weak -fobjc-arc -c -o $@ $<
+$(TARGET): $(OBJS)
+	@mkdir -p bin
+	$(CXX) -o $@ $^ $(CXXFLAGS) $(LIBS)
 
-$(BIN_DIR)/%.o:$(IMGUI_DIR)/backends/%.mm | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -ObjC++ -fobjc-weak -fobjc-arc -c -o $@ $<
+obj/%.o: %.cpp
+	@mkdir -p obj
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BIN_DIR):
-	mkdir -p $(BIN_DIR)
+obj/%.o: %.mm
+	@mkdir -p obj
+	$(CXX) $(OBJCXXFLAGS) -c $< -o $@
 
-all: $(BIN_DIR) $(EXE)
-	@echo Build complete
+obj/%.o: lib/%.cpp
+	@mkdir -p obj
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(EXE): $(OBJS)
-	$(CXX) -o $@ $(OBJS) $(CXXFLAGS) $(LIBS)
+obj/%.o: lib/%.mm
+	@mkdir -p obj
+	$(CXX) $(OBJCXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(EXE) $(OBJS)
-	rmdir $(BIN_DIR) 2>/dev/null || true
+	rm -rf obj
+	rm -f $(TARGET)
 
 run:
 	clear
@@ -54,15 +50,15 @@ run:
 	make all
 	./bin/metal
 
-# Force rebuild of object files
+# Touch rebuild
 .PHONY: force
 force:
-	touch main.mm
+	touch $(SRCS)
 	make
 
-# Debug target
+# Debug info
 .PHONY: debug
 debug:
-	@echo "SOURCES: $(SOURCES)"
+	@echo "SRCS: $(SRCS)"
 	@echo "OBJS: $(OBJS)"
-	@echo "BIN_DIR: $(BIN_DIR)"
+	@echo "TARGET: $(TARGET)"
