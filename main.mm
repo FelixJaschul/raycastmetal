@@ -130,39 +130,52 @@ struct Sector {
 };
 
 static struct Developer_Config{
-    bool show_ui;
-    bool show_level_in_top_view;
-    bool toggle_window_size;
-    bool mouse_captured;
+    bool show_ui = false;
+    bool show_level_in_top_view = false;
+    bool toggle_window_size = false;
+    bool mouse_captured = false;
 
     struct Camera_Config {
-        bool show_ui_of_camera;
-        f32 EYE_Z_runtime;
-        f32 HFOV_runtime;
-        f32 VFOV_runtime;
-        f32 ZNEAR_runtime;
-        f32 ZFAR_runtime;
-        f32 mouse_sensitivity;
-        f32 mouse_sensitivity_vertical;
-        f32 vertical_angle;
+        bool show_ui_of_camera = true;
+        f32 EYE_Z_runtime = EYE_Z;
+        f32 HFOV_runtime = HFOV;
+        f32 VFOV_runtime = VFOV;
+        f32 ZNEAR_runtime = ZNEAR;
+        f32 ZFAR_runtime = ZFAR;
+        f32 mouse_sensitivity = 0.0025f;
+        f32 mouse_sensitivity_vertical = 0.0025f;
+        f32 vertical_angle = 0.0f;
     } camera;
 
-    struct Rendering_Config { bool show_ui_of_rendering; } renderer;
+    struct Rendering_Config { 
+        bool show_ui_of_rendering = true; 
+    } renderer;
 
     struct Level_Config {
-        bool show_ui_of_level;
-        struct Level_Data_Config { bool show_ui_of_data; char file_buf[256]; } data;
-        struct Level_Sector_Config { bool show_ui_of_sector; int idx = -1; } sector;
+        bool show_ui_of_level = true;
+
+        struct Level_Data_Config { 
+            bool show_ui_of_data = true; 
+            char file_buf[256]; 
+        } data;
+
+        struct Level_Sector_Config { 
+            bool show_ui_of_sector = true; 
+            int idx = -1; 
+        } sector;
+
         struct Level_Wall_Config { 
-            bool show_ui_of_wall; 
+            bool show_ui_of_wall = true; 
             bool clip_to_neighboring_wall; 
             int idx = -1;
             bool is_creating_wall = false;
             v2 wall_start_point;
             int hovered_wall_idx = -1;
-            char hovered_point = 0; // 'A' or 'B' for which point is hovered
+            char hovered_point = 0;
         } wall;
+
     } level;
+
 } dev;
 
 static struct {
@@ -193,13 +206,14 @@ static struct {
     u16 y_lo[SCREEN_WIDTH], y_hi[SCREEN_WIDTH];
 
     struct {
-        v2 pos;
-        f32 angle, anglecos, anglesin;
-        int sector;
-        f32 current_height;  // Current camera height
-        f32 target_height;   // Target height based on floor
-        f32 bob_time;        // Time counter for view bobbing
-        f32 bob_offset;      // Current bobbing offset
+        v2 pos = {3.0f, 3.0f};
+        f32 angle = 0.0f;
+        f32 anglecos, anglesin;
+        int sector = 1;
+        f32 current_height = EYE_Z;
+        f32 target_height = EYE_Z;
+        f32 bob_time = 0.0f;
+        f32 bob_offset = 0.0f;
     } camera;
 
 } state;
@@ -1191,42 +1205,6 @@ static void init_sdl_and_state() {
 
     state.pixels = new u32[SCREEN_WIDTH * SCREEN_HEIGHT];
     ASSERT(state.pixels, "failed to allocate pixel buffer\n");
-
-    state.camera.pos = {3.0f, 3.0f};
-    state.camera.angle = 0.0f;
-    state.camera.sector = 1;
-    state.camera.current_height = EYE_Z;
-    state.camera.target_height = EYE_Z;
-    state.camera.bob_time = 0.0f;
-    state.camera.bob_offset = 0.0f;
-
-    dev.camera.EYE_Z_runtime = EYE_Z;
-    dev.camera.HFOV_runtime = HFOV;
-    dev.camera.VFOV_runtime = VFOV;
-    dev.camera.ZFAR_runtime = ZFAR;
-    dev.camera.ZNEAR_runtime = ZNEAR;
-    dev.camera.mouse_sensitivity = 0.0025f;
-    dev.camera.mouse_sensitivity_vertical = 0.0025f;
-    dev.camera.vertical_angle = 0.0f;
-
-    dev.show_ui = false;
-    dev.show_level_in_top_view = false;
-    dev.toggle_window_size = false;
-    dev.mouse_captured = true;
-
-    dev.camera.show_ui_of_camera = true;
-
-    dev.renderer.show_ui_of_rendering = true;
-
-    dev.level.show_ui_of_level = true;
-    dev.level.data.show_ui_of_data = true;
-
-    dev.level.sector.show_ui_of_sector = true;
-    dev.level.sector.idx = -1;
-
-    dev.level.wall.show_ui_of_wall = true;
-    dev.level.wall.idx = -1;
-    dev.level.wall.clip_to_neighboring_wall = true;
 
     state.quit = false;
 }
